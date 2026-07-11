@@ -46,6 +46,8 @@ MariaDB function semantics differ from DuckDB in several areas. These are handle
 | `regexp_substr(VARCHAR, VARCHAR)` | Not in DuckDB | Custom implementation using RE2 |
 | `json_unquote(VARCHAR)` | Not in DuckDB | Custom implementation (strip quotes + unescape) |
 | `json_contains(VARCHAR, VARCHAR, VARCHAR)` | DuckDB only has 2-arg form | 3-arg placeholder (returns false — needs proper implementation) |
+| `date_format(TIMESTAMP/DATE/TIMESTAMPTZ, VARCHAR)` | Not in DuckDB; `strftime()` uses different specifiers (`%i` vs `%M` etc.) | Native MariaDB-semantics formatter: all specifiers incl. WEEK modes (`%U %u %V %X %v %x`, ported from `calc_week()`), `%D` ordinals, English names; TIMESTAMPTZ overload honors session TimeZone via ICU bind |
+| `unix_timestamp(TIMESTAMPTZ)` | Not in DuckDB | Epoch seconds as DOUBLE (microsecond-exact); naive TIMESTAMP/DATE arguments arrive via DuckDB's implicit cast, which applies the session TimeZone. 0-arg `UNIX_TIMESTAMP()` is not implemented |
 
 ### Compatible aliases (already work in DuckDB)
 
@@ -165,8 +167,7 @@ These have not been triggered yet but are likely to cause issues when more compl
 | MariaDB function | DuckDB equivalent | Notes |
 |---|---|---|
 | `GROUP_CONCAT()` | `string_agg()` / `list_aggr()` | Different syntax and separator handling |
-| `DATE_FORMAT()` | `strftime()` | Different format specifiers |
-| `UNIX_TIMESTAMP()` | `epoch()` | -- |
+| `UNIX_TIMESTAMP()` (no args) | `epoch(now())` | Arg-less current-time form not implemented; only `UNIX_TIMESTAMP(expr)` is (see §2) |
 | `FORMAT(number, decimals)` | -- | MariaDB: locale-aware number formatting; DuckDB: printf-style |
 | `FOUND_ROWS()` | -- | No equivalent |
 | `LAST_INSERT_ID()` | -- | No equivalent |

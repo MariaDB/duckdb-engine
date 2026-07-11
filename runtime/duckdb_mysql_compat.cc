@@ -50,11 +50,19 @@
 #include "duckdb/function/function_set.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/common/types/date.hpp"
+#include "duckdb/common/types/time.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/connection.hpp"
 
 #include "duckdb/common/types/string_type.hpp"
 #include "re2/re2.h"
+
+/* ICU extension headers — used to honor the session TimeZone in
+   TIMESTAMPTZ compat overloads (MariaDB TIMESTAMP columns are stored
+   as TIMESTAMPTZ). The extension is statically built into the bundle. */
+#include "icu-datefunc.hpp"
+#include "unicode/ucal.h"
 
 namespace myduck
 {
@@ -983,6 +991,286 @@ static void locate_3arg_func(duckdb::DataChunk &args,
 }
 
 /* ================================================================
+   date_format(TIMESTAMP/DATE, VARCHAR) -> VARCHAR
+   MariaDB DATE_FORMAT() uses MySQL format specifiers, which differ
+   from the C-strftime specifiers of DuckDB's strftime() (e.g. %i vs
+   %M for minutes, %M vs %B for month name), so the format string
+   cannot be just pushed to DuckDB — we format natively with MariaDB
+   semantics. Month/day names are English (lc_time_names=en_US, the 
+   default).
+   ================================================================ */
+
+static const char *mysql_month_names[]= {
+    "January", "February", "March",     "April",   "May",      "June",
+    "July",    "August",   "September", "October", "November", "December"};
+
+/* Indexed by ISO day of week - 1 (1=Monday .. 7=Sunday) */
+static const char *mysql_day_names[]= {"Monday", "Tuesday",  "Wednesday",
+                                       "Thursday", "Friday", "Saturday",
+                                       "Sunday"};
+
+static int32_t days_in_year(int32_t year)
+{
+  return duckdb::Date::IsLeapYear(year) ? 366 : 365;
+}
+
+/*
+  Weekday index of a day number (days since 1970-01-01, a Thursday).
+  Equivalent of MariaDB calc_weekday(): 0 = Sunday when sunday_first,
+  0 = Monday otherwise.
+*/
+static uint32_t weekday_of(int64_t daynr, bool sunday_first)
+{
+  int64_t monday_idx= (daynr + 3) % 7; /* epoch day 0 -> 3 (Thursday) */
+  if (monday_idx < 0)
+    monday_idx+= 7;
+  if (!sunday_first)
+    return (uint32_t) monday_idx;
+  return (uint32_t) ((monday_idx + 1) % 7);
+}
+
+/*
+  Port of MariaDB calc_week() (sql/sql_time.cc) onto DuckDB dates.
+  Flag combinations used by DATE_FORMAT (after MariaDB week_mode()
+  normalization, which sets first_weekday for the Sunday-first modes):
+    %U     : monday_first=0 week_year=0 first_weekday=1  (WEEK mode 0)
+    %u     : monday_first=1 week_year=0 first_weekday=0  (WEEK mode 1)
+    %V, %X : monday_first=0 week_year=1 first_weekday=1  (WEEK mode 2)
+    %v, %x : monday_first=1 week_year=1 first_weekday=0  (WEEK mode 3)
+*/
+static uint32_t calc_week(duckdb::date_t d, bool monday_first, bool week_year,
+                          bool first_weekday, int32_t &out_year)
+{
+  int32_t y, month, day;
+  duckdb::Date::Convert(d, y, month, day);
+  int64_t daynr= duckdb::Date::EpochDays(d);
+  int64_t first_daynr=
+      duckdb::Date::EpochDays(duckdb::Date::FromDate(y, 1, 1));
+  uint32_t weekday= weekday_of(first_daynr, !monday_first);
+  out_year= y;
+  int64_t days;
+
+  if (month == 1 && day <= (int32_t) (7 - weekday))
+  {
+    if (!week_year &&
+        ((first_weekday && weekday != 0) || (!first_weekday && weekday >= 4)))
+      return 0;
+    week_year= true;
+    out_year--;
+    int32_t days_prev= days_in_year(out_year);
+    first_daynr-= days_prev;
+    weekday= (weekday + 53 * 7 - days_prev) % 7;
+  }
+
+  if ((first_weekday && weekday != 0) || (!first_weekday && weekday >= 4))
+    days= daynr - (first_daynr + (7 - weekday));
+  else
+    days= daynr - (first_daynr - weekday);
+
+  if (week_year && days >= 52 * 7)
+  {
+    weekday= (weekday + days_in_year(out_year)) % 7;
+    if ((!first_weekday && weekday < 4) || (first_weekday && weekday == 0))
+    {
+      out_year++;
+      return 1;
+    }
+  }
+  return (uint32_t) (days / 7 + 1);
+}
+
+static void mysql_date_format(std::string &out, duckdb::date_t d,
+                              duckdb::dtime_t t, const char *fmt,
+                              size_t fmt_len)
+{
+  int32_t year, month, day;
+  duckdb::Date::Convert(d, year, month, day);
+  int32_t hour, minute, sec, micros;
+  duckdb::Time::Convert(t, hour, minute, sec, micros);
+  int32_t iso_dow= duckdb::Date::ExtractISODayOfTheWeek(d); /* 1=Mon..7=Sun */
+  int32_t hour12= hour % 12;
+  if (hour12 == 0) /* 0 and 12 o'clock both display as 12 on a 12-hour dial */
+    hour12= 12;
+
+  char buf[32];
+  auto append= [&](const char *format, auto value) {
+    snprintf(buf, sizeof(buf), format, value);
+    out+= buf;
+  };
+
+  for (size_t i= 0; i < fmt_len; i++)
+  {
+    if (fmt[i] != '%' || i + 1 >= fmt_len)
+    {
+      out+= fmt[i];
+      continue;
+    }
+    i++;
+    int32_t week_year;
+    switch (fmt[i])
+    {
+    case 'Y': append("%04d", year); break;
+    case 'y': append("%02d", year % 100); break;
+    case 'm': append("%02d", month); break;
+    case 'c': append("%d", month); break;
+    case 'd': append("%02d", day); break;
+    case 'e': append("%d", day); break;
+    case 'H': append("%02d", hour); break;
+    case 'k': append("%d", hour); break;
+    case 'h':
+    case 'I': append("%02d", hour12); break;
+    case 'l': append("%d", hour12); break;
+    case 'i': append("%02d", minute); break;
+    case 's':
+    case 'S': append("%02d", sec); break;
+    case 'f': append("%06d", micros); break;
+    case 'p': out+= hour < 12 ? "AM" : "PM"; break;
+    case 'r':
+      snprintf(buf, sizeof(buf), "%02d:%02d:%02d %s", hour12, minute, sec,
+               hour < 12 ? "AM" : "PM");
+      out+= buf;
+      break;
+    case 'T':
+      snprintf(buf, sizeof(buf), "%02d:%02d:%02d", hour, minute, sec);
+      out+= buf;
+      break;
+    case 'M': out+= mysql_month_names[month - 1]; break;
+    case 'b': out.append(mysql_month_names[month - 1], 3); break;
+    case 'W': out+= mysql_day_names[iso_dow - 1]; break;
+    case 'a': out.append(mysql_day_names[iso_dow - 1], 3); break;
+    case 'j': append("%03d", duckdb::Date::ExtractDayOfTheYear(d)); break;
+    case 'w': append("%d", iso_dow % 7); break; /* 0=Sunday..6=Saturday */
+    case 'D':
+      append("%d", day);
+      if (day % 100 >= 11 && day % 100 <= 13)
+        out+= "th";
+      else
+        switch (day % 10)
+        {
+        case 1: out+= "st"; break;
+        case 2: out+= "nd"; break;
+        case 3: out+= "rd"; break;
+        default: out+= "th"; break;
+        }
+      break;
+    case 'U': append("%02u", calc_week(d, false, false, true, week_year));
+      break;
+    case 'u': append("%02u", calc_week(d, true, false, false, week_year));
+      break;
+    case 'V': append("%02u", calc_week(d, false, true, true, week_year));
+      break;
+    case 'v': append("%02u", calc_week(d, true, true, false, week_year));
+      break;
+    case 'X':
+      calc_week(d, false, true, true, week_year);
+      append("%04d", week_year);
+      break;
+    case 'x':
+      calc_week(d, true, true, false, week_year);
+      append("%04d", week_year);
+      break;
+    case '%': out+= '%'; break;
+    default: out+= fmt[i]; break; /* MariaDB drops the '%' */
+    }
+  }
+}
+
+static void date_format_ts_func(duckdb::DataChunk &args,
+                                duckdb::ExpressionState &,
+                                duckdb::Vector &result)
+{
+  duckdb::BinaryExecutor::Execute<duckdb::timestamp_t, duckdb::string_t,
+                                  duckdb::string_t>(
+      args.data[0], args.data[1], result, args.size(),
+      [&](duckdb::timestamp_t ts, duckdb::string_t fmt) -> duckdb::string_t {
+        duckdb::date_t d;
+        duckdb::dtime_t t;
+        duckdb::Timestamp::Convert(ts, d, t);
+        std::string out;
+        out.reserve(fmt.GetSize() + 16); // just reserve a little bit extra, as an optimization
+        mysql_date_format(out, d, t, fmt.GetData(), fmt.GetSize());
+        return duckdb::StringVector::AddString(result, out);
+      });
+}
+
+static void date_format_date_func(duckdb::DataChunk &args,
+                                  duckdb::ExpressionState &,
+                                  duckdb::Vector &result)
+{
+  duckdb::BinaryExecutor::Execute<duckdb::date_t, duckdb::string_t,
+                                  duckdb::string_t>(
+      args.data[0], args.data[1], result, args.size(),
+      [&](duckdb::date_t d, duckdb::string_t fmt) -> duckdb::string_t {
+        std::string out;
+        out.reserve(fmt.GetSize() + 16); // just reserve a little bit extra, as an optimization
+        mysql_date_format(out, d, duckdb::dtime_t(0), fmt.GetData(),
+                          fmt.GetSize());
+        return duckdb::StringVector::AddString(result, out);
+      });
+}
+
+/*
+  date_format(TIMESTAMPTZ, VARCHAR): MariaDB TIMESTAMP columns are stored
+  as TIMESTAMPTZ, and DuckDB has no implicit TIMESTAMPTZ -> TIMESTAMP cast
+  for function binding. Mirror the ICU extension's own strftime: bind
+  ICUDateFunc::BindData (captures the session TimeZone), then convert each
+  instant to local wall-clock fields before formatting.
+*/
+static void date_format_tstz_func(duckdb::DataChunk &args,
+                                  duckdb::ExpressionState &state,
+                                  duckdb::Vector &result)
+{
+  using duckdb::ICUDateFunc;
+  auto &func_expr= state.expr.Cast<duckdb::BoundFunctionExpression>();
+  auto &info= func_expr.bind_info->Cast<ICUDateFunc::BindData>();
+  duckdb::CalendarPtr calendar_ptr(info.calendar->clone());
+  auto *calendar= calendar_ptr.get();
+
+  duckdb::BinaryExecutor::Execute<duckdb::timestamp_t, duckdb::string_t,
+                                  duckdb::string_t>(
+      args.data[0], args.data[1], result, args.size(),
+      [&](duckdb::timestamp_t ts, duckdb::string_t fmt) -> duckdb::string_t {
+        uint64_t micros= ICUDateFunc::SetTime(calendar, ts);
+        int32_t year= ICUDateFunc::ExtractField(calendar, UCAL_YEAR);
+        int32_t month= ICUDateFunc::ExtractField(calendar, UCAL_MONTH) + 1;
+        int32_t day= ICUDateFunc::ExtractField(calendar, UCAL_DATE);
+        int32_t hour= ICUDateFunc::ExtractField(calendar, UCAL_HOUR_OF_DAY);
+        int32_t minute= ICUDateFunc::ExtractField(calendar, UCAL_MINUTE);
+        int32_t sec= ICUDateFunc::ExtractField(calendar, UCAL_SECOND);
+        int32_t millis= ICUDateFunc::ExtractField(calendar, UCAL_MILLISECOND);
+        duckdb::date_t d= duckdb::Date::FromDate(year, month, day);
+        duckdb::dtime_t t= duckdb::Time::FromTime(
+            hour, minute, sec, millis * 1000 + (int32_t) micros);
+        std::string out;
+        out.reserve(fmt.GetSize() + 16); // just reserve a little bit extra, as an optimization
+        mysql_date_format(out, d, t, fmt.GetData(), fmt.GetSize());
+        return duckdb::StringVector::AddString(result, out);
+      });
+}
+
+/* ================================================================
+   unix_timestamp(TIMESTAMPTZ) -> DOUBLE
+   MariaDB UNIX_TIMESTAMP(ts) interprets ts in the session time zone.
+   A TIMESTAMPTZ value is already epoch microseconds; naive TIMESTAMP
+   and DATE arguments reach this overload through DuckDB's implicit
+   cast, which applies the session TimeZone (ICU) — matching MariaDB.
+   DOUBLE keeps microsecond precision exactly up to ~2^53 us (year
+   2255); the server-side result field (INT or DECIMAL(,N) chosen by
+   MariaDB from the argument's precision) does the final rounding.
+   ================================================================ */
+
+static void unix_timestamp_func(duckdb::DataChunk &args,
+                                duckdb::ExpressionState &,
+                                duckdb::Vector &result)
+{
+  duckdb::UnaryExecutor::Execute<duckdb::timestamp_t, double>(
+      args.data[0], result, args.size(),
+      [](duckdb::timestamp_t ts) -> double {
+        return (double) ts.value / 1000000.0;
+      });
+}
+
+/* ================================================================
    Registration
    ================================================================ */
 
@@ -1403,11 +1691,40 @@ void register_mysql_compat_functions(duckdb::DatabaseInstance &db)
     catalog.CreateFunction(transaction, info);
   }
 
+  /* date_format(TIMESTAMP/DATE, VARCHAR) — MySQL format specifiers */
+  {
+    duckdb::ScalarFunctionSet set("date_format");
+    set.AddFunction(duckdb::ScalarFunction(
+        {duckdb::LogicalType::TIMESTAMP, duckdb::LogicalType::VARCHAR},
+        duckdb::LogicalType::VARCHAR, date_format_ts_func));
+    set.AddFunction(duckdb::ScalarFunction(
+        {duckdb::LogicalType::DATE, duckdb::LogicalType::VARCHAR},
+        duckdb::LogicalType::VARCHAR, date_format_date_func));
+    set.AddFunction(duckdb::ScalarFunction(
+        {duckdb::LogicalType::TIMESTAMP_TZ, duckdb::LogicalType::VARCHAR},
+        duckdb::LogicalType::VARCHAR, date_format_tstz_func,
+        duckdb::ICUDateFunc::Bind));
+    duckdb::CreateScalarFunctionInfo info(std::move(set));
+    info.on_conflict= duckdb::OnCreateConflict::ALTER_ON_CONFLICT;
+    catalog.CreateFunction(transaction, info);
+  }
+
+  /* unix_timestamp(TIMESTAMPTZ) -> DOUBLE */
+  {
+    duckdb::ScalarFunctionSet set("unix_timestamp");
+    set.AddFunction(duckdb::ScalarFunction(
+        {duckdb::LogicalType::TIMESTAMP_TZ}, duckdb::LogicalType::DOUBLE,
+        unix_timestamp_func));
+    duckdb::CreateScalarFunctionInfo info(std::move(set));
+    info.on_conflict= duckdb::OnCreateConflict::ALTER_ON_CONFLICT;
+    catalog.CreateFunction(transaction, info);
+  }
+
   sql_print_information(
       "DuckDB: registered MySQL-compatible function overloads "
       "(octet_length, length, ascii, ord, hex, oct, bin, locate, mid, "
       "rtrim, ltrim, regexp_instr, regexp_replace, regexp_substr, "
-      "json_unquote, json_contains)");
+      "json_unquote, json_contains, date_format, unix_timestamp)");
 }
 
 } /* namespace myduck */
