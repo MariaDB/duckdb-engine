@@ -1,0 +1,206 @@
+--source ../include/have_duckdb.inc
+
+# MDEV-40197: DATE_FORMAT() and UNIX_TIMESTAMP() had no DuckDB equivalents
+# and failed pushdown with "Catalog Error: Scalar Function ... does not
+# exist".  duckdb_mysql_compat.cc now provides MariaDB-semantics
+# implementations (MySQL format specifiers, incl. the four WEEK modes for
+# %U %u %V %X %v %x, English month/day names, %D ordinals).
+#
+# Every query below runs against a DuckDB table first and an identical
+# InnoDB table second — each pair of result blocks must be identical.
+# The row set encodes the tricky cases: week numbers at year boundaries,
+# leap day, ordinal suffixes, AM/PM edges, microseconds and NULLs.
+#
+# time_zone is pinned: TIMESTAMP columns are stored as TIMESTAMPTZ in
+# DuckDB and both UNIX_TIMESTAMP() and DATE_FORMAT() on them follow the
+# session time zone (via the ICU-bound TIMESTAMPTZ overloads).
+
+SET SESSION time_zone='+00:00';
+
+CREATE DATABASE test_duckdb_df;
+USE test_duckdb_df;
+
+CREATE TABLE t_duck (id INT PRIMARY KEY, ts DATETIME(6), dcol DATE,
+                     tcol TIMESTAMP NULL) ENGINE=DuckDB;
+CREATE TABLE t_inno (id INT PRIMARY KEY, ts DATETIME(6), dcol DATE,
+                     tcol TIMESTAMP NULL) ENGINE=InnoDB;
+
+INSERT INTO t_duck VALUES
+ (1,'2013-07-15 10:30:45.123456','2013-07-15','2013-07-15 10:30:45'),
+ (2,'2013-01-01 00:00:00','2013-01-01','2013-01-01 00:00:00'),
+ (3,'2012-12-31 23:59:59','2012-12-31','2012-12-31 23:59:59'),
+ (4,'2016-02-29 12:00:00','2016-02-29','2016-02-29 12:00:00'),
+ (5,'2020-01-01 01:02:03','2020-01-01','2020-01-01 01:02:03'),
+ (6,'2021-01-01 13:00:00','2021-01-01','2021-01-01 13:00:00'),
+ (7,'1999-01-03 06:07:08','1999-01-03','1999-01-03 06:07:08'),
+ (8,'2000-01-01 18:30:00','2000-01-01','2000-01-01 18:30:00'),
+ (9,'2013-07-01 00:00:00','2013-07-01','2013-07-01 00:00:00'),
+ (10,'2013-07-02 11:59:59','2013-07-02','2013-07-02 11:59:59'),
+ (11,'2013-07-03 12:00:01','2013-07-03','2013-07-03 12:00:01'),
+ (12,'2013-07-11 07:00:00','2013-07-11','2013-07-11 07:00:00'),
+ (13,'2013-07-13 07:00:00','2013-07-13','2013-07-13 07:00:00'),
+ (14,'2013-07-21 07:00:00','2013-07-21','2013-07-21 07:00:00'),
+ (15,'2013-07-22 07:00:00','2013-07-22','2013-07-22 07:00:00'),
+ (16,'2013-07-23 07:00:00','2013-07-23','2013-07-23 07:00:00'),
+ (17,'2013-07-31 07:00:00','2013-07-31','2013-07-31 07:00:00'),
+ (18,'2026-01-01 00:00:01','2026-01-01','2026-01-01 00:00:01'),
+ (19,'1970-01-02 00:00:00','1970-01-02','1970-01-02 00:00:00'),
+ (20,NULL,NULL,NULL);
+INSERT INTO t_inno VALUES
+ (1,'2013-07-15 10:30:45.123456','2013-07-15','2013-07-15 10:30:45'),
+ (2,'2013-01-01 00:00:00','2013-01-01','2013-01-01 00:00:00'),
+ (3,'2012-12-31 23:59:59','2012-12-31','2012-12-31 23:59:59'),
+ (4,'2016-02-29 12:00:00','2016-02-29','2016-02-29 12:00:00'),
+ (5,'2020-01-01 01:02:03','2020-01-01','2020-01-01 01:02:03'),
+ (6,'2021-01-01 13:00:00','2021-01-01','2021-01-01 13:00:00'),
+ (7,'1999-01-03 06:07:08','1999-01-03','1999-01-03 06:07:08'),
+ (8,'2000-01-01 18:30:00','2000-01-01','2000-01-01 18:30:00'),
+ (9,'2013-07-01 00:00:00','2013-07-01','2013-07-01 00:00:00'),
+ (10,'2013-07-02 11:59:59','2013-07-02','2013-07-02 11:59:59'),
+ (11,'2013-07-03 12:00:01','2013-07-03','2013-07-03 12:00:01'),
+ (12,'2013-07-11 07:00:00','2013-07-11','2013-07-11 07:00:00'),
+ (13,'2013-07-13 07:00:00','2013-07-13','2013-07-13 07:00:00'),
+ (14,'2013-07-21 07:00:00','2013-07-21','2013-07-21 07:00:00'),
+ (15,'2013-07-22 07:00:00','2013-07-22','2013-07-22 07:00:00'),
+ (16,'2013-07-23 07:00:00','2013-07-23','2013-07-23 07:00:00'),
+ (17,'2013-07-31 07:00:00','2013-07-31','2013-07-31 07:00:00'),
+ (18,'2026-01-01 00:00:01','2026-01-01','2026-01-01 00:00:01'),
+ (19,'1970-01-02 00:00:00','1970-01-02','1970-01-02 00:00:00'),
+ (20,NULL,NULL,NULL);
+
+--echo ----- basic date/time specifiers -----
+SELECT id, DATE_FORMAT(ts, '%Y-%m-%d %H:%i:%s') AS f FROM t_duck ORDER BY id;
+SELECT id, DATE_FORMAT(ts, '%Y-%m-%d %H:%i:%s') AS f FROM t_inno ORDER BY id;
+
+--echo ----- unpadded / 12-hour / AM-PM specifiers -----
+SELECT id, DATE_FORMAT(ts, '%y|%c|%e|%k|%h|%I|%l|%p') AS f FROM t_duck ORDER BY id;
+SELECT id, DATE_FORMAT(ts, '%y|%c|%e|%k|%h|%I|%l|%p') AS f FROM t_inno ORDER BY id;
+
+--echo ----- %r %T %f -----
+SELECT id, DATE_FORMAT(ts, '%r # %T # %f') AS f FROM t_duck ORDER BY id;
+SELECT id, DATE_FORMAT(ts, '%r # %T # %f') AS f FROM t_inno ORDER BY id;
+
+--echo ----- names, day-of-year, weekday, ordinals -----
+SELECT id, DATE_FORMAT(ts, '%M %b %W %a %j %w %D') AS f FROM t_duck ORDER BY id;
+SELECT id, DATE_FORMAT(ts, '%M %b %W %a %j %w %D') AS f FROM t_inno ORDER BY id;
+
+--echo ----- week numbers: all four WEEK modes -----
+SELECT id, DATE_FORMAT(ts, '%U %u %V %X %v %x') AS f FROM t_duck ORDER BY id;
+SELECT id, DATE_FORMAT(ts, '%U %u %V %X %v %x') AS f FROM t_inno ORDER BY id;
+
+--echo ----- literal %% and unknown specifier passthrough -----
+SELECT id, DATE_FORMAT(ts, 'x%%y %q %Y') AS f FROM t_duck ORDER BY id;
+SELECT id, DATE_FORMAT(ts, 'x%%y %q %Y') AS f FROM t_inno ORDER BY id;
+
+--echo ----- DATE argument: time parts are 00 -----
+SELECT id, DATE_FORMAT(dcol, '%Y-%m-%d %H:%i:%s %W %f') AS f FROM t_duck ORDER BY id;
+SELECT id, DATE_FORMAT(dcol, '%Y-%m-%d %H:%i:%s %W %f') AS f FROM t_inno ORDER BY id;
+
+--echo ----- TIMESTAMP column at UTC: TIMESTAMPTZ overload baseline (no tz shift) -----
+# tcol is a MariaDB TIMESTAMP -> DuckDB TIMESTAMPTZ, so this hits the ICU overload
+# date_format_tstz_func. At +00:00 the UTC render is the identity (no shift), so this
+# only validates field extraction across all rows; tz-offset application is exercised
+# by the +03:00 / -05:00 blocks below.
+SELECT id, DATE_FORMAT(tcol, '%Y-%m-%d %H:%i:%s') AS f FROM t_duck ORDER BY id;
+SELECT id, DATE_FORMAT(tcol, '%Y-%m-%d %H:%i:%s') AS f FROM t_inno ORDER BY id;
+
+--echo ----- UNIX_TIMESTAMP on DATETIME(6), DATE and TIMESTAMP -----
+SELECT id, UNIX_TIMESTAMP(ts) AS u1, UNIX_TIMESTAMP(dcol) AS u2,
+       UNIX_TIMESTAMP(tcol) AS u3 FROM t_duck ORDER BY id;
+SELECT id, UNIX_TIMESTAMP(ts) AS u1, UNIX_TIMESTAMP(dcol) AS u2,
+       UNIX_TIMESTAMP(tcol) AS u3 FROM t_inno ORDER BY id;
+
+--echo ----- non-UTC session time zone (positive offset, same day) -----
+SET SESSION time_zone='+03:00';
+SELECT id, DATE_FORMAT(tcol, '%Y-%m-%d %H:%i:%s') AS f,
+       UNIX_TIMESTAMP(ts) AS u FROM t_duck WHERE id IN (1,2) ORDER BY id;
+SELECT id, DATE_FORMAT(tcol, '%Y-%m-%d %H:%i:%s') AS f,
+       UNIX_TIMESTAMP(ts) AS u FROM t_inno WHERE id IN (1,2) ORDER BY id;
+SET SESSION time_zone='+00:00';
+
+--echo ----- negative offset crossing a day/month/year boundary -----
+# A -05:00 offset pushes a 00:00 wall clock back past midnight (rows 2/18/19 are
+# all at/just-after midnight), so the formatted date rolls to the previous day —
+# and previous month/year for the Jan-1 rows — exercising date rollover in the
+# TIMESTAMPTZ (ICU) field extraction that the +03:00 same-day case never hits.
+# UNIX_TIMESTAMP(ts) here is on the naive DATETIME, so it is interpreted in the
+# session tz and shifts with the offset (unlike UNIX_TIMESTAMP on a TIMESTAMP,
+# which is an instant and is tz-invariant).
+# NOTE: a named DST zone (e.g. Europe/Helsinki) is intentionally not tested — the
+# MTR server has no mysql.time_zone tables loaded, so MariaDB rejects named zones;
+# the engine itself passes named zones through to DuckDB/ICU unchanged.
+SET SESSION time_zone='-05:00';
+SELECT id, DATE_FORMAT(tcol, '%Y-%m-%d %H:%i:%s') AS f,
+       UNIX_TIMESTAMP(ts) AS u FROM t_duck WHERE id IN (2,18,19) ORDER BY id;
+SELECT id, DATE_FORMAT(tcol, '%Y-%m-%d %H:%i:%s') AS f,
+       UNIX_TIMESTAMP(ts) AS u FROM t_inno WHERE id IN (2,18,19) ORDER BY id;
+SET SESSION time_zone='+00:00';
+
+--echo ----- ClickBench Q43 shape (MDEV-40197) -----
+SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:00:00') AS M, COUNT(*) AS PageViews
+  FROM t_duck WHERE id BETWEEN 9 AND 17 GROUP BY M ORDER BY M;
+SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:00:00') AS M, COUNT(*) AS PageViews
+  FROM t_inno WHERE id BETWEEN 9 AND 17 GROUP BY M ORDER BY M;
+
+--echo ----- %S (seconds alias), literal %% and a trailing lone % -----
+# %S is the alias of %s; a '%' with nothing after it is emitted verbatim
+# by both engines (MariaDB make_date_time() and mysql_date_format()).
+SELECT id, DATE_FORMAT(ts, '%H:%i:%S | pct%% end%') AS f
+  FROM t_duck WHERE id IN (1,6) ORDER BY id;
+SELECT id, DATE_FORMAT(ts, '%H:%i:%S | pct%% end%') AS f
+  FROM t_inno WHERE id IN (1,6) ORDER BY id;
+
+--echo ----- column-valued (per-row) format argument -----
+# The format above is always a constant; here it is a column, exercising the
+# per-row (flat vector) path of both the naive-TIMESTAMP overload (DATETIME)
+# and the ICU TIMESTAMPTZ overload (TIMESTAMP).  Rows 6/7 cover a NULL date
+# and a NULL format string respectively (both must yield NULL).
+CREATE TABLE cf_duck (id INT PRIMARY KEY, ts DATETIME(6),
+                      tcol TIMESTAMP NULL, fmt VARCHAR(32)) ENGINE=DuckDB;
+CREATE TABLE cf_inno (id INT PRIMARY KEY, ts DATETIME(6),
+                      tcol TIMESTAMP NULL, fmt VARCHAR(32)) ENGINE=InnoDB;
+INSERT INTO cf_duck VALUES
+ (1,'2013-07-15 10:30:45.123456','2013-07-15 10:30:45','%Y-%m-%d %H:%i:%S'),
+ (2,'2016-02-29 12:00:00','2016-02-29 12:00:00','%W, %M %D %Y'),
+ (3,'2012-12-31 23:59:59','2012-12-31 23:59:59','%v/%x wk %j'),
+ (4,'2021-01-01 13:00:00','2021-01-01 13:00:00','%r'),
+ (5,'2020-01-01 01:02:03','2020-01-01 01:02:03','pct%% end%'),
+ (6,NULL,NULL,'%Y-%m-%d'),
+ (7,'1999-01-03 06:07:08','1999-01-03 06:07:08',NULL);
+INSERT INTO cf_inno VALUES
+ (1,'2013-07-15 10:30:45.123456','2013-07-15 10:30:45','%Y-%m-%d %H:%i:%S'),
+ (2,'2016-02-29 12:00:00','2016-02-29 12:00:00','%W, %M %D %Y'),
+ (3,'2012-12-31 23:59:59','2012-12-31 23:59:59','%v/%x wk %j'),
+ (4,'2021-01-01 13:00:00','2021-01-01 13:00:00','%r'),
+ (5,'2020-01-01 01:02:03','2020-01-01 01:02:03','pct%% end%'),
+ (6,NULL,NULL,'%Y-%m-%d'),
+ (7,'1999-01-03 06:07:08','1999-01-03 06:07:08',NULL);
+SELECT id, DATE_FORMAT(ts, fmt) AS f_ts, DATE_FORMAT(tcol, fmt) AS f_tz
+  FROM cf_duck ORDER BY id;
+SELECT id, DATE_FORMAT(ts, fmt) AS f_ts, DATE_FORMAT(tcol, fmt) AS f_tz
+  FROM cf_inno ORDER BY id;
+
+--echo ----- pre-1970 dates: weekday_of() negative day-number branch -----
+# calc_week() (reached only by %U %u %V %X %v %x) calls weekday_of() with the
+# day number of Jan 1; for years < 1970 that number is negative, exercising the
+# "monday_idx < 0" wrap that no row in the main table reaches.
+CREATE TABLE pre_duck (id INT PRIMARY KEY, ts DATETIME) ENGINE=DuckDB;
+CREATE TABLE pre_inno (id INT PRIMARY KEY, ts DATETIME) ENGINE=InnoDB;
+INSERT INTO pre_duck VALUES
+ (1,'1969-01-01 00:00:00'),
+ (2,'1969-12-31 23:59:59'),
+ (3,'1968-02-29 12:00:00'),
+ (4,'1960-07-04 08:00:00'),
+ (5,'1955-01-02 00:00:00');
+INSERT INTO pre_inno VALUES
+ (1,'1969-01-01 00:00:00'),
+ (2,'1969-12-31 23:59:59'),
+ (3,'1968-02-29 12:00:00'),
+ (4,'1960-07-04 08:00:00'),
+ (5,'1955-01-02 00:00:00');
+SELECT id, DATE_FORMAT(ts, '%Y-%m-%d %W %j') AS f,
+       DATE_FORMAT(ts, '%U %u %V %X %v %x') AS wk FROM pre_duck ORDER BY id;
+SELECT id, DATE_FORMAT(ts, '%Y-%m-%d %W %j') AS f,
+       DATE_FORMAT(ts, '%U %u %V %X %v %x') AS wk FROM pre_inno ORDER BY id;
+
+DROP DATABASE test_duckdb_df;

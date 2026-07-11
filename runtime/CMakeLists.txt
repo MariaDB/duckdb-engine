@@ -16,6 +16,13 @@ ADD_LIBRARY(duckdb_runtime STATIC ${DUCKDB_RUNTIME_SOURCES})
 duckdb_setup_target(duckdb_runtime)
 
 TARGET_INCLUDE_DIRECTORIES(duckdb_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+# ICU extension headers: session-TimeZone-aware TIMESTAMPTZ overloads in
+# duckdb_mysql_compat.cc reuse ICUDateFunc from the statically built bundle.
+TARGET_INCLUDE_DIRECTORIES(duckdb_runtime SYSTEM PRIVATE
+  ${DUCKDB_SUBMODULE_DIR}/extension/icu/include
+  ${DUCKDB_SUBMODULE_DIR}/extension/icu/third_party/icu/i18n
+  ${DUCKDB_SUBMODULE_DIR}/extension/icu/third_party/icu/common
+)
 TARGET_LINK_LIBRARIES(duckdb_runtime PUBLIC duckdb_convertor duckdb_common)
 
 IF(DUCKDB_UNIT_TESTS)
